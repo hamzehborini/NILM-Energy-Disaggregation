@@ -1,0 +1,74 @@
+from datetime import datetime
+import numpy as np
+
+JORDAN_TIERS = [
+    (160, 33), (300, 76), (500, 114), (float('inf'), 141)
+]
+FIXED_CHARGE_FILS = 600
+
+def calc_jordan_bill(kwh_month):
+    remaining = kwh_month
+    total_fils = FIXED_CHARGE_FILS
+    breakdown = []
+    prev = 0
+    for limit, rate in JORDAN_TIERS:
+        if remaining <= 0: break
+        tier_kwh = min(remaining, limit - prev)
+        tier_fils = tier_kwh * rate
+        breakdown.append({'tier': f"{prev+1}-{int(limit) if limit!=float('inf') else 'inf'} kWh",
+                          'kwh': round(tier_kwh,2), 'rate_fils': rate, 'cost_jod': round(tier_fils/1000,3)})
+        total_fils += tier_fils; remaining -= tier_kwh; prev = limit
+    return {'total_jod': round(total_fils/1000,3), 'breakdown': breakdown, 'kwh_month': round(kwh_month,2)}
+
+def estimate_bill_from_session(results, duration_hours):
+    if duration_hours <= 0: return {}
+    hours_in_month = 30 * 24
+    per_appliance = {}
+    total_kwh_session = 0
+    for app, r in results.items():
+        kwh = r['kwh']
+        kwh_monthly = kwh * (hours_in_month / duration_hours)
+        bill = calc_jordan_bill(kwh_monthly)
+        per_appliance[app] = {'kwh_session': round(kwh,3), 'kwh_monthly': round(kwh_monthly,2), 'bill_jod': bill['total_jod']}
+        total_kwh_session += kwh
+    total_kwh_monthly = total_kwh_session * (hours_in_month / duration_hours)
+    total_bill = calc_jordan_bill(total_kwh_monthly)
+    return {'per_appliance': per_appliance, 'total_kwh_session': round(total_kwh_session,3),
+            'total_kwh_monthly': round(total_kwh_monthly,2), 'total_bill': total_bill, 'duration_hours': round(duration_hours,1)}
+
+def generate_pdf_report(results, bill_info, filename="nilm_report.pdf"):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+        doc = SimpleDocTemplate(filename, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+        story = []; styles = getSampleStyleSheet()
+        title_s = ParagraphStyle('T', fontSize=18, fontName='Helvetica-Bold', textColor=colors.HexColor('#4f46e5'), spaceAfter=6)
+        h2_s    = ParagraphStyle('H2', fontSize=13, fontName='Helvetica-Bold', spaceBefore=12, spaceAfter=6)
+        story.append(Paragraph("NILM Smart Energy Analytics Report", title_s))
+        story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
+        story.append(Spacer(1, 0.4*cm))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#4f46e5')))
+        story.append(Spacer(1, 0.4*cm))
+        story.append(Paragraph("Appliance Summary", h2_s))
+        ICONS = {'kettle':'Kettle','fridge':'Fridge','washing_machine':'Washing Machine','dishwasher':'Dishwasher'}
+        tdata = [['Appliance','ON Time (min)','Energy (kWh)','Monthly Bill (JOD)']]
+        for app, r in results.items():
+            b = bill_info['per_appliance'].get(app,{})
+            tdata.append([ICONS.get(app,app), str(r['on_minutes']), f"{r['kwh']:.3f}", f"{b.get('bill_jod',0):.3f}"])
+        tdata.append(['TOTAL','',f"{bill_info['total_kwh_session']:.3f}",f"{bill_info['total_bill']['total_jod']:.3f}"])
+        t = Table(tdata, colWidths=[5*cm,3.5*cm,3.5*cm,5*cm])
+        t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#4f46e5')),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('ALIGN',(1,0),(-1,-1),'CENTER'),('GRID',(0,0),(-1,-1),0.5,colors.HexColor('#ccccee')),
+            ('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(t)
+        story.append(Spacer(1,0.4*cm))
+        story.append(Paragraph("Bill Estimation (Jordan EMRC Tariff)", h2_s))
+        story.append(Paragraph(f"Projected Monthly: {bill_info['total_kwh_monthly']:.1f} kWh — Estimated Bill: {bill_info['total_bill']['total_jod']:.3f} JOD", styles['Normal']))
+        doc.build(story)
+        return True, filename
+    except Exception as e:
+        return False, str(e)

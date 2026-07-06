@@ -1,0 +1,68 @@
+import sqlite3, pandas as pd
+from datetime import datetime
+
+DB_PATH = "nilm_analytics.db"
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT, uploaded_at TEXT, n_rows INTEGER, duration_h REAL, mean_watts REAL
+    );
+    CREATE TABLE IF NOT EXISTS appliance_predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        upload_id INTEGER, minute INTEGER, appliance TEXT,
+        predicted_state INTEGER, estimated_watts REAL, estimated_kwh REAL,
+        confidence REAL, recorded_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS energy_statistics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        upload_id INTEGER, appliance TEXT, on_minutes INTEGER,
+        total_kwh REAL, avg_watts REAL, bill_jod REAL, recorded_at TEXT
+    );
+    """)
+    conn.commit(); conn.close()
+
+def save_upload(filename, n_rows, duration_h, mean_watts):
+    conn = get_conn(); c = conn.cursor()
+    c.execute("INSERT INTO uploads (filename,uploaded_at,n_rows,duration_h,mean_watts) VALUES (?,?,?,?,?)",
+              (filename, datetime.now().isoformat(), n_rows, duration_h, mean_watts))
+    uid = c.lastrowid; conn.commit(); conn.close(); return uid
+
+def save_predictions(upload_id, results, bill_map):
+    conn = get_conn(); c = conn.cursor(); now = datetime.now().isoformat()
+    for app, r in results.items():
+        rows = [(upload_id, int(t), app, int(p), float(w), float(w)/1000/60, float(prob), now)
+                for t,p,w,prob in zip(r['time_idx'],r['preds'],r['est_watts'],r['probs'])]
+        c.executemany("INSERT INTO appliance_predictions (upload_id,minute,appliance,predicted_state,estimated_watts,estimated_kwh,confidence,recorded_at) VALUES (?,?,?,?,?,?,?,?)", rows)
+        c.execute("INSERT INTO energy_statistics (upload_id,appliance,on_minutes,total_kwh,avg_watts,bill_jod,recorded_at) VALUES (?,?,?,?,?,?,?)",
+                  (upload_id, app, r['on_minutes'], r['kwh'], r['kwh']*1000/max(r['on_minutes'],1)*60, bill_map.get(app,0), now))
+    conn.commit(); conn.close()
+
+def get_history(limit=20):
+    conn = get_conn()
+    df = pd.read_sql_query("""SELECT u.id,u.filename,u.uploaded_at,u.n_rows,u.duration_h,
+        ROUND(SUM(e.total_kwh),3) as total_kwh, ROUND(SUM(e.bill_jod),3) as total_bill_jod
+        FROM uploads u LEFT JOIN energy_statistics e ON e.upload_id=u.id
+        GROUP BY u.id ORDER BY u.uploaded_at DESC LIMIT ?""", conn, params=(limit,))
+    conn.close(); return df
+
+def get_appliance_history():
+    conn = get_conn()
+    df = pd.read_sql_query("""SELECT appliance, SUM(on_minutes) as total_minutes,
+        ROUND(SUM(total_kwh),3) as total_kwh, ROUND(SUM(bill_jod),3) as total_bill_jod,
+        COUNT(DISTINCT upload_id) as sessions FROM energy_statistics GROUP BY appliance ORDER BY total_kwh DESC""", conn)
+    conn.close(); return df
+
+def get_daily_trends():
+    conn = get_conn()
+    df = pd.read_sql_query("""SELECT DATE(recorded_at) as date, appliance,
+        ROUND(SUM(estimated_kwh),4) as kwh FROM appliance_predictions
+        WHERE predicted_state=1 GROUP BY date,appliance ORDER BY date""", conn)
+    conn.close(); return df

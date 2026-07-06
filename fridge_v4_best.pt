@@ -1,0 +1,516 @@
+"""
+app.py — NILM Smart Energy Analytics Platform
+KASIT Graduation Project | Dr. Ruba Obiedat | University of Jordan
+Run: streamlit run app.py
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import torch
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import os
+from datetime import datetime
+
+from models   import APPLIANCE_CONFIG, load_model, disaggregate
+from database import init_db, save_upload, save_predictions, get_history, get_appliance_history, get_daily_trends
+from analytics import estimate_bill_from_session, calc_jordan_bill, generate_pdf_report
+
+init_db()
+
+st.set_page_config(page_title="NILM Energy Analytics", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Inter:wght@300;400;500&display=swap');
+html,body,[class*="css"]{font-family:'Inter',sans-serif;}
+h1,h2,h3{font-family:'Syne',sans-serif;}
+.stApp{background:#0a0a0f;}
+[data-testid="stSidebar"]{background:#0d0d18;border-right:1px solid #1e1e30;}
+.kpi-card{background:linear-gradient(135deg,#12121e 0%,#1a1a2e 100%);border:1px solid #2a2a45;border-radius:14px;padding:20px 24px;margin-bottom:8px;position:relative;overflow:hidden;}
+.kpi-card::before{content:'';position:absolute;top:0;left:0;width:4px;height:100%;border-radius:4px 0 0 4px;}
+.kpi-card.red::before{background:#ef4444;}.kpi-card.blue::before{background:#3b82f6;}
+.kpi-card.purple::before{background:#8b5cf6;}.kpi-card.green::before{background:#10b981;}
+.kpi-card.indigo::before{background:#6366f1;}.kpi-card.amber::before{background:#f59e0b;}
+.kpi-value{font-family:'Syne',monospace;font-size:1.9rem;font-weight:800;color:#f0f0ff;margin:4px 0;}
+.kpi-label{font-size:0.72rem;color:#6868a0;text-transform:uppercase;letter-spacing:1.2px;}
+.kpi-sub{font-size:0.82rem;color:#9090c0;margin-top:4px;}
+.section-header{font-family:'Syne',sans-serif;font-size:1.15rem;font-weight:700;color:#a0a0e0;text-transform:uppercase;letter-spacing:2px;margin:24px 0 12px;padding-bottom:8px;border-bottom:1px solid #1e1e35;}
+.info-bar{background:linear-gradient(90deg,#1a1a35,#12122a);border:1px solid #2a2a50;border-radius:10px;padding:12px 18px;color:#9090c0;font-size:0.85rem;margin:8px 0 16px;}
+.stButton>button{background:linear-gradient(135deg,#4f46e5,#6366f1);color:white;border:none;border-radius:10px;padding:10px 22px;font-family:'Syne',sans-serif;font-weight:600;font-size:0.88rem;transition:all 0.2s;width:100%;}
+.stButton>button:hover{background:linear-gradient(135deg,#6366f1,#818cf8);}
+.tier-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e1e30;font-size:0.83rem;color:#9090c0;}
+.tier-cost{color:#10b981;font-weight:600;}
+.saving-tip{background:#0d2e1a;border:1px solid #10b981;border-radius:8px;padding:12px 16px;margin:6px 0;color:#6ee7b7;font-size:0.85rem;}
+</style>
+""", unsafe_allow_html=True)
+
+for key, default in [('models_loaded',False),('results',None),('df',None),('bill_info',None),('upload_id',None)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── Sidebar ──
+with st.sidebar:
+    st.markdown("## ⚡ NILM Analytics")
+    st.markdown("---")
+    page = st.radio("Navigation", [
+        "🔬 Disaggregation",
+        "📊 Analytics Dashboard",
+        "💡 Bill Estimator",
+        "🔮 Forecasting",
+    ], label_visibility="collapsed")
+    st.markdown("---")
+    st.markdown("### ⚙️ Models")
+    models_dir    = st.text_input("Models folder", value="models/")
+    device_choice = st.selectbox("Device", ["auto","cpu","cuda"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device_choice=="auto" else torch.device(device_choice)
+    st.markdown(f"<span style='color:#6868a0;font-size:0.8rem'>Device: <b style='color:#a0a0e0'>{device}</b></span>", unsafe_allow_html=True)
+
+    if st.button("⚙️ Load Models"):
+        missing = [cfg['model_file'] for cfg in APPLIANCE_CONFIG.values() if not os.path.exists(f"{models_dir}/{cfg['model_file']}")]
+        if missing:
+            st.error("Missing: " + ", ".join(missing))
+        else:
+            with st.spinner("Loading..."):
+                loaded = {}; ok = True
+                for app in APPLIANCE_CONFIG:
+                    try: loaded[app] = load_model(app, models_dir, device)
+                    except Exception as e: st.error(f"{app}: {e}"); ok = False; break
+                if ok:
+                    st.session_state.loaded_models = loaded
+                    st.session_state.models_loaded = True
+                    st.success("✅ All 4 models loaded!")
+
+    if st.session_state.models_loaded:
+        for app, cfg in APPLIANCE_CONFIG.items():
+            color = cfg['color']; icon = cfg['icon']; label = cfg['label']
+            st.markdown(f"<span style='color:{color}'>{icon}</span> {label} ✅", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("""<div style='font-size:0.72rem;color:#404060;line-height:1.7'>
+    KASIT · University of Jordan<br>Supervised by Dr. Ruba Obiedat<br>
+    REFIT Dataset · Leave-one-house-out<br>Validation: House 20</div>""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════
+# PAGE: DISAGGREGATION
+# ══════════════════════════════════════════
+if "Disaggregation" in page:
+    st.markdown("# ⚡ Energy Disaggregation")
+    st.markdown("### Non-Intrusive Load Monitoring")
+    st.markdown("<div class='info-bar'>Upload a CSV with smart meter readings (1-minute resolution, Watts). The system identifies active appliances and estimates energy consumption.</div>", unsafe_allow_html=True)
+
+    col1, col2 = st.columns([2,1])
+    with col1:
+        uploaded = st.file_uploader("Upload Smart Meter CSV", type=["csv"])
+    with col2:
+        st.markdown("**Expected format:**")
+        st.dataframe(pd.DataFrame({'timestamp':['2024-01-01 00:00','2024-01-01 00:01'],'aggregate':[245.3,2187.6]}), hide_index=True, use_container_width=True)
+        st.caption("1-minute resolution · Watts")
+
+    c1, _ = st.columns([1,4])
+    with c1:
+        use_demo = st.button("🎲 Demo Data")
+
+    if use_demo:
+        np.random.seed(42); N = 1440; t = np.arange(N)
+        base = 250 + 20*np.sin(2*np.pi*t/1440) + np.random.normal(0,10,N)
+        for s in [180,480,1020]: base[s:s+3] += 2500
+        for s in range(0,N,20): base[s:s+8] += 85
+        base[300:420] += 800; base[600:720] += 900
+        base = np.clip(base,0,None).round(1)
+        st.session_state.df = pd.DataFrame({'timestamp':pd.date_range('2024-01-01',periods=N,freq='1min'),'aggregate':base})
+        st.success("✅ Demo: 24 hours × 1 min")
+
+    if uploaded:
+        try:
+            df = pd.read_csv(uploaded)
+            agg_col = next((c for c in df.columns if c.lower() in ['aggregate','aggregate_watts','power','watts']), None)
+            if not agg_col: st.error(f"No aggregate column. Found: {list(df.columns)}")
+            else:
+                df = df.rename(columns={agg_col:'aggregate'})
+                df['aggregate'] = pd.to_numeric(df['aggregate'],errors='coerce').fillna(0).clip(lower=0)
+                st.session_state.df = df
+                st.success(f"✅ Loaded {len(df):,} readings from '{uploaded.name}'")
+        except Exception as e: st.error(f"Error: {e}")
+
+    if st.session_state.df is not None:
+        df  = st.session_state.df
+        agg = df['aggregate'].values.astype(np.float32)
+
+        st.markdown("<div class='section-header'>Aggregate Signal Preview</div>", unsafe_allow_html=True)
+        fig_agg = go.Figure(go.Scatter(y=agg[:min(1440,len(agg))], mode='lines', line=dict(color='#6366f1',width=1.5)))
+        fig_agg.update_layout(paper_bgcolor='#0a0a0f',plot_bgcolor='#0d0d18',font_color='#e8e8f0',height=180,
+                               margin=dict(l=0,r=0,t=10,b=0),yaxis_title="Watts",showlegend=False)
+        fig_agg.update_xaxes(gridcolor='#1a1a2e'); fig_agg.update_yaxes(gridcolor='#1a1a2e')
+        st.plotly_chart(fig_agg, use_container_width=True)
+
+        duration_h = len(agg)/60
+        cols = st.columns(3)
+        cols[0].metric("Readings",f"{len(agg):,}"); cols[1].metric("Duration",f"{duration_h:.1f} h"); cols[2].metric("Mean Load",f"{agg.mean():.0f} W")
+        st.markdown("---")
+
+        if not st.session_state.models_loaded:
+            st.warning("⚠️ Load models first using the sidebar.")
+        else:
+            if st.button("🚀 Run Disaggregation"):
+                with st.spinner("Running inference on all 4 appliances..."):
+                    try:
+                        results   = disaggregate(agg, st.session_state.loaded_models, device)
+                        bill_info = estimate_bill_from_session(results, duration_h)
+                        fname = getattr(uploaded,'name','demo_data.csv') if uploaded else 'demo_data.csv'
+                        uid   = save_upload(fname, len(agg), duration_h, float(agg.mean()))
+                        save_predictions(uid, results, {a:bill_info['per_appliance'][a]['bill_jod'] for a in bill_info['per_appliance']})
+                        st.session_state.results   = results
+                        st.session_state.bill_info = bill_info
+                        st.session_state.upload_id = uid
+                        st.success("✅ Disaggregation complete!")
+                    except Exception as e: st.error(f"Error: {e}"); st.exception(e)
+
+    if st.session_state.results:
+        results   = st.session_state.results
+        bill_info = st.session_state.bill_info
+
+        st.markdown("<div class='section-header'>Results</div>", unsafe_allow_html=True)
+        total_kwh = sum(r['kwh'] for r in results.values())
+        cols = st.columns(5)
+        with cols[0]:
+            st.markdown(f"<div class='kpi-card indigo'><div class='kpi-label'>Total Identified</div><div class='kpi-value'>{total_kwh:.2f}</div><div class='kpi-sub'>kWh</div></div>", unsafe_allow_html=True)
+        for i,(app,cfg) in enumerate(APPLIANCE_CONFIG.items()):
+            r = results[app]
+            cn = {'kettle':'red','fridge':'blue','washing_machine':'purple','dishwasher':'green'}[app]
+            with cols[i+1]:
+                st.markdown(f"<div class='kpi-card {cn}'><div style='font-size:1.5rem'>{cfg['icon']}</div><div class='kpi-label'>{cfg['label']}</div><div class='kpi-value'>{r['kwh']:.2f}</div><div class='kpi-sub'>{r['on_minutes']} min ON</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='section-header'>Energy Breakdown</div>", unsafe_allow_html=True)
+        pie_col, bar_col = st.columns(2)
+        with pie_col:
+            labels=[APPLIANCE_CONFIG[a]['label'] for a in results]; values=[results[a]['kwh'] for a in results]; colors=[APPLIANCE_CONFIG[a]['color'] for a in results]
+            agg_kwh = df['aggregate'].values.mean()*len(df)/1000/60
+            unid = max(0,agg_kwh-sum(values))
+            if unid>0: labels.append("Other"); values.append(unid); colors.append('#2a2a45')
+            fig_pie = go.Figure(go.Pie(labels=labels,values=values,marker_colors=colors,hole=0.55,textinfo='label+percent',textfont_size=11))
+            fig_pie.update_layout(paper_bgcolor='#0a0a0f',font_color='#e8e8f0',height=280,margin=dict(l=0,r=0,t=10,b=0),showlegend=False)
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with bar_col:
+            fig_bar = go.Figure()
+            for app,cfg in APPLIANCE_CONFIG.items():
+                fig_bar.add_trace(go.Bar(name=cfg['label'],x=[cfg['label']],y=[results[app]['kwh']],marker_color=cfg['color'],text=f"{results[app]['kwh']:.2f}",textposition='outside'))
+            fig_bar.update_layout(paper_bgcolor='#0a0a0f',plot_bgcolor='#0d0d18',font_color='#e8e8f0',height=280,margin=dict(l=0,r=0,t=10,b=20),showlegend=False,yaxis_title="kWh",bargap=0.35)
+            fig_bar.update_xaxes(gridcolor='#1a1a2e'); fig_bar.update_yaxes(gridcolor='#1a1a2e')
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        st.markdown("<div class='section-header'>Appliance Activity Timeline</div>", unsafe_allow_html=True)
+        agg_arr = df['aggregate'].values
+        fig = make_subplots(rows=5,cols=1,shared_xaxes=True,vertical_spacing=0.03,
+                            subplot_titles=['Aggregate','Kettle','Fridge','Washing Machine','Dishwasher'])
+        fig.add_trace(go.Scatter(y=agg_arr,mode='lines',line=dict(color='#6366f1',width=1),showlegend=False),row=1,col=1)
+        for i,(app,cfg) in enumerate(APPLIANCE_CONFIG.items()):
+            r = results[app]; h = cfg['color'].lstrip('#')
+            rgba = 'rgba('+','.join(str(int(h[j:j+2],16)) for j in (0,2,4))+',0.25)'
+            fig.add_trace(go.Scatter(x=r['time_idx'],y=r['est_watts'],mode='lines',fill='tozeroy',
+                          line=dict(color=cfg['color'],width=1),fillcolor=rgba,name=cfg['label'],showlegend=True),row=i+2,col=1)
+        fig.update_layout(paper_bgcolor='#0a0a0f',plot_bgcolor='#0d0d18',font_color='#e8e8f0',height=580,
+                          margin=dict(l=60,r=20,t=30,b=40),legend=dict(orientation='h',y=-0.06,bgcolor='#12121e'))
+        for i in range(1,6): fig.update_xaxes(gridcolor='#1a1a2e',row=i,col=1); fig.update_yaxes(gridcolor='#1a1a2e',row=i,col=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("<div class='section-header'>Appliance Summary</div>", unsafe_allow_html=True)
+        table = []
+        for app,cfg in APPLIANCE_CONFIG.items():
+            r=results[app]; b=bill_info['per_appliance'].get(app,{})
+            table.append({'Appliance':cfg['icon']+'  '+cfg['label'],'Status':'🟢 Detected' if r['on_minutes']>0 else '⚫ Not detected',
+                          'ON Time':f"{r['on_minutes']} min",'Energy':f"{r['kwh']:.3f} kWh",'Est. Monthly Bill':f"{b.get('bill_jod',0):.3f} JOD",'Architecture':'CNN-BiLSTM'})
+        st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+
+        st.markdown("<div class='section-header'>Export</div>", unsafe_allow_html=True)
+        exp_rows = []
+        for app,cfg in APPLIANCE_CONFIG.items():
+            r=results[app]
+            for t,pred,prob,w in zip(r['time_idx'],r['preds'],r['probs'],r['est_watts']):
+                exp_rows.append({'minute':int(t),'appliance':cfg['label'],'prediction':int(pred),'probability':round(float(prob),4),'est_watts':float(w)})
+        exp_df = pd.DataFrame(exp_rows)
+        c1,c2 = st.columns(2)
+        with c1:
+            st.download_button("⬇️ Download Predictions CSV", data=exp_df.to_csv(index=False).encode(), file_name="nilm_predictions.csv", mime="text/csv")
+        with c2:
+            if st.button("📄 Generate PDF Report"):
+                ok,path = generate_pdf_report(results, bill_info)
+                if ok:
+                    with open(path,'rb') as f:
+                        st.download_button("⬇️ Download PDF", data=f.read(), file_name="nilm_report.pdf", mime="application/pdf")
+                else: st.warning(f"PDF failed: {path}. Run: pip install reportlab")
+
+
+# ══════════════════════════════════════════
+# PAGE: ANALYTICS DASHBOARD
+# ══════════════════════════════════════════
+elif "Analytics" in page:
+    st.markdown("# 📊 Analytics Dashboard")
+    st.markdown("### Historical Energy Intelligence")
+    st.markdown("<div class='info-bar'>This page shows aggregated statistics across all past disaggregation sessions stored in the local database.</div>", unsafe_allow_html=True)
+
+    history  = get_history()
+    app_hist = get_appliance_history()
+    daily    = get_daily_trends()
+
+    if history.empty:
+        st.info("No data yet — run a disaggregation first.")
+    else:
+        st.markdown("<div class='section-header'>Overall Statistics</div>", unsafe_allow_html=True)
+        cols = st.columns(4)
+        cols[0].metric("Total Sessions",  len(history))
+        cols[1].metric("Total Energy",    f"{history['total_kwh'].sum():.2f} kWh")
+        cols[2].metric("Total Est. Bill", f"{history['total_bill_jod'].sum():.3f} JOD")
+        cols[3].metric("Avg per Session", f"{history['total_kwh'].mean():.2f} kWh")
+
+        if not app_hist.empty:
+            st.markdown("<div class='section-header'>Appliance Energy Ranking</div>", unsafe_allow_html=True)
+            c1,c2 = st.columns(2)
+            with c1:
+                fig_rank = go.Figure(go.Bar(x=app_hist['appliance'],y=app_hist['total_kwh'],
+                    marker_color=[APPLIANCE_CONFIG[a]['color'] for a in app_hist['appliance']],
+                    text=[f"{v:.2f}" for v in app_hist['total_kwh']],textposition='outside'))
+                fig_rank.update_layout(paper_bgcolor='#0a0a0f',plot_bgcolor='#0d0d18',font_color='#e8e8f0',
+                    height=300,margin=dict(l=0,r=0,t=20,b=0),yaxis_title="Total kWh",title="Total Energy by Appliance")
+                fig_rank.update_xaxes(gridcolor='#1a1a2e'); fig_rank.update_yaxes(gridcolor='#1a1a2e')
+                st.plotly_chart(fig_rank, use_container_width=True)
+            with c2:
+                st.dataframe(app_hist.rename(columns={'appliance':'Appliance','total_minutes':'ON Mins','total_kwh':'kWh','total_bill_jod':'Bill (JOD)','sessions':'Sessions'}), hide_index=True, use_container_width=True)
+
+        if not daily.empty:
+            st.markdown("<div class='section-header'>Daily Energy Trends</div>", unsafe_allow_html=True)
+            fig_daily = px.line(daily,x='date',y='kwh',color='appliance',title="Daily kWh by Appliance")
+            fig_daily.update_layout(paper_bgcolor='#0a0a0f',plot_bgcolor='#0d0d18',font_color='#e8e8f0',height=320,margin=dict(l=0,r=0,t=40,b=0))
+            fig_daily.update_xaxes(gridcolor='#1a1a2e'); fig_daily.update_yaxes(gridcolor='#1a1a2e')
+            st.plotly_chart(fig_daily, use_container_width=True)
+
+        st.markdown("<div class='section-header'>Session History</div>", unsafe_allow_html=True)
+        st.dataframe(history.rename(columns={'filename':'File','uploaded_at':'Date','n_rows':'Rows','duration_h':'Hours','total_kwh':'kWh','total_bill_jod':'Bill (JOD)'}), hide_index=True, use_container_width=True)
+        st.download_button("⬇️ Export History CSV", data=history.to_csv(index=False).encode(), file_name="nilm_history.csv", mime="text/csv")
+
+
+# ══════════════════════════════════════════
+# PAGE: BILL ESTIMATOR
+# ══════════════════════════════════════════
+elif "Bill" in page:
+    st.markdown("# 💡 Electricity Bill Estimator")
+    st.markdown("### Jordan EMRC Residential Tariff (Supported Category)")
+    st.markdown("<div class='info-bar'>Official Jordan EMRC tiered residential tariff: 33 fils/kWh (0–160), 76 fils/kWh (161–300), 114 fils/kWh (301–500), 141 fils/kWh (500+).</div>", unsafe_allow_html=True)
+
+    if st.session_state.bill_info:
+        bill = st.session_state.bill_info
+        st.markdown("<div class='section-header'>Current Session Estimate</div>", unsafe_allow_html=True)
+        cols = st.columns(3)
+        with cols[0]:
+            st.markdown(f"<div class='kpi-card amber'><div class='kpi-label'>Session Energy</div><div class='kpi-value'>{bill['total_kwh_session']:.2f}</div><div class='kpi-sub'>kWh in {bill['duration_hours']:.1f} hours</div></div>", unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown(f"<div class='kpi-card green'><div class='kpi-label'>Estimated Monthly</div><div class='kpi-value'>{bill['total_kwh_monthly']:.1f}</div><div class='kpi-sub'>kWh extrapolated to 30 days</div></div>", unsafe_allow_html=True)
+        with cols[2]:
+            st.markdown(f"<div class='kpi-card indigo'><div class='kpi-label'>Monthly Bill</div><div class='kpi-value'>{bill['total_bill']['total_jod']:.3f}</div><div class='kpi-sub'>JOD estimated</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='section-header'>Tariff Tier Breakdown</div>", unsafe_allow_html=True)
+        for t in bill['total_bill']['breakdown']:
+            st.markdown(f"<div class='tier-row'><span>{t['tier']}</span><span>{t['kwh']:.1f} kWh × {t['rate_fils']} fils</span><span class='tier-cost'>{t['cost_jod']:.3f} JOD</span></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='section-header'>Per Appliance Monthly Estimate</div>", unsafe_allow_html=True)
+        rows=[]
+        for app,cfg in APPLIANCE_CONFIG.items():
+            b=bill['per_appliance'].get(app,{})
+            rows.append({'Appliance':cfg['icon']+' '+cfg['label'],'Session kWh':b.get('kwh_session',0),'Monthly kWh':b.get('kwh_monthly',0),'Monthly Bill':f"{b.get('bill_jod',0):.3f} JOD"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("Run a disaggregation first to see the bill estimate.")
+
+    st.markdown("---")
+    st.markdown("<div class='section-header'>Manual Bill Calculator</div>", unsafe_allow_html=True)
+    manual_kwh = st.number_input("Enter monthly consumption (kWh)", min_value=0.0, value=300.0, step=10.0)
+    if manual_kwh > 0:
+        result = calc_jordan_bill(manual_kwh)
+        st.metric("Estimated Bill", f"{result['total_jod']:.3f} JOD")
+        for t in result['breakdown']:
+            st.markdown(f"<div class='tier-row'><span>{t['tier']}</span><span>{t['kwh']:.1f} kWh × {t['rate_fils']} fils</span><span class='tier-cost'>{t['cost_jod']:.3f} JOD</span></div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════
+# PAGE: FORECASTING
+# ══════════════════════════════════════════
+elif "Forecasting" in page:
+    st.markdown("# 🔮 Energy Forecasting")
+    st.markdown("### Monthly Bill Prediction & Savings Simulator")
+    st.markdown("<div class='info-bar'>Based on your current usage pattern, this page projects your full monthly energy consumption and bill. Use the savings simulator to see how reducing appliance usage affects your bill.</div>", unsafe_allow_html=True)
+
+    if not st.session_state.results:
+        st.info("Run a disaggregation first to see forecasting.")
+    else:
+        results   = st.session_state.results
+        bill_info = st.session_state.bill_info
+        duration_h = len(st.session_state.df) / 60
+        hours_in_month = 30 * 24  # 720 hours
+
+        # ── Monthly Bill Forecast ──
+        st.markdown("<div class='section-header'>📅 Monthly Bill Forecast</div>", unsafe_allow_html=True)
+
+        forecast_rows = []
+        total_monthly_kwh = 0
+        for app, cfg in APPLIANCE_CONFIG.items():
+            r = results[app]
+            kwh_monthly = r['kwh'] * (hours_in_month / max(duration_h, 0.01))
+            total_monthly_kwh += kwh_monthly
+            forecast_rows.append({'app': app, 'cfg': cfg, 'kwh_monthly': kwh_monthly})
+
+        total_bill = calc_jordan_bill(total_monthly_kwh)
+
+        cols = st.columns(4)
+        with cols[0]:
+            st.markdown(f"<div class='kpi-card indigo'><div class='kpi-label'>Data Covers</div><div class='kpi-value'>{duration_h:.1f}h</div><div class='kpi-sub'>{duration_h/24:.1f} days of usage</div></div>", unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown(f"<div class='kpi-card amber'><div class='kpi-label'>Projected Monthly kWh</div><div class='kpi-value'>{total_monthly_kwh:.1f}</div><div class='kpi-sub'>if usage continues</div></div>", unsafe_allow_html=True)
+        with cols[2]:
+            st.markdown(f"<div class='kpi-card green'><div class='kpi-label'>Projected Monthly Bill</div><div class='kpi-value'>{total_bill['total_jod']:.3f}</div><div class='kpi-sub'>JOD (Jordan EMRC tariff)</div></div>", unsafe_allow_html=True)
+        with cols[3]:
+            daily_avg = total_monthly_kwh / 30
+            st.markdown(f"<div class='kpi-card blue'><div class='kpi-label'>Daily Average</div><div class='kpi-value'>{daily_avg:.2f}</div><div class='kpi-sub'>kWh per day</div></div>", unsafe_allow_html=True)
+
+        # ── Monthly calendar-style bar chart ──
+        st.markdown("<div class='section-header'>📈 Projected Monthly Usage (30 Days)</div>", unsafe_allow_html=True)
+
+        days = [f"Day {i+1}" for i in range(30)]
+        fig_forecast = go.Figure()
+        np.random.seed(42)
+        for row in forecast_rows:
+            daily_kwh = row['kwh_monthly'] / 30
+            noise = np.random.normal(0, daily_kwh * 0.08, 30)
+            values = np.maximum(0, daily_kwh + noise)
+            hex_c  = row['cfg']['color'].lstrip('#')
+            rgba   = 'rgba('+','.join(str(int(hex_c[j:j+2],16)) for j in (0,2,4))+',0.2)'
+            fig_forecast.add_trace(go.Scatter(
+                x=days, y=values, mode='lines+markers',
+                name=row['cfg']['label'],
+                line=dict(color=row['cfg']['color'], width=2),
+                fill='tozeroy', fillcolor=rgba,
+                marker=dict(size=4),
+            ))
+        fig_forecast.update_layout(
+            paper_bgcolor='#0a0a0f', plot_bgcolor='#0d0d18',
+            font_color='#e8e8f0', height=350,
+            margin=dict(l=0,r=0,t=20,b=20),
+            yaxis_title="kWh/day",
+            legend=dict(orientation='h', y=-0.15, bgcolor='#12121e'),
+        )
+        fig_forecast.update_xaxes(gridcolor='#1a1a2e', tickangle=45)
+        fig_forecast.update_yaxes(gridcolor='#1a1a2e')
+        st.plotly_chart(fig_forecast, use_container_width=True)
+
+        # ── Monthly cumulative cost chart ──
+        st.markdown("<div class='section-header'>💰 Cumulative Bill Growth (30 Days)</div>", unsafe_allow_html=True)
+
+        cumulative_kwh  = np.cumsum([total_monthly_kwh/30] * 30)
+        cumulative_bill = [calc_jordan_bill(k)['total_jod'] for k in cumulative_kwh]
+
+        fig_cum = go.Figure()
+        fig_cum.add_trace(go.Scatter(
+            x=days, y=cumulative_bill,
+            mode='lines+markers',
+            line=dict(color='#f59e0b', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(245,158,11,0.15)',
+            name='Cumulative Bill (JOD)',
+            marker=dict(size=5),
+        ))
+        # Add tier threshold lines
+        tier_kwh_limits = [160, 300, 500]
+        tier_labels     = ["Tier 1→2 (160 kWh)", "Tier 2→3 (300 kWh)", "Tier 3→4 (500 kWh)"]
+        tier_colors     = ["#6366f1", "#8b5cf6", "#ef4444"]
+        for limit, label, color in zip(tier_kwh_limits, tier_labels, tier_colors):
+            day_hit = next((i+1 for i,k in enumerate(cumulative_kwh) if k >= limit), None)
+            if day_hit:
+                fig_cum.add_vline(x=f"Day {day_hit}", line_dash="dash", line_color=color, opacity=0.6,
+                                  annotation_text=label, annotation_position="top right",
+                                  annotation_font_color=color)
+        fig_cum.update_layout(
+            paper_bgcolor='#0a0a0f', plot_bgcolor='#0d0d18',
+            font_color='#e8e8f0', height=320,
+            margin=dict(l=0,r=0,t=20,b=20),
+            yaxis_title="Bill (JOD)", showlegend=False,
+        )
+        fig_cum.update_xaxes(gridcolor='#1a1a2e', tickangle=45)
+        fig_cum.update_yaxes(gridcolor='#1a1a2e')
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+        # ── Tier breakdown for monthly projection ──
+        st.markdown("<div class='section-header'>📊 Tariff Tier Breakdown (Monthly Projection)</div>", unsafe_allow_html=True)
+        for t in total_bill['breakdown']:
+            st.markdown(f"<div class='tier-row'><span>{t['tier']}</span><span>{t['kwh']:.1f} kWh × {t['rate_fils']} fils/kWh</span><span class='tier-cost'>{t['cost_jod']:.3f} JOD</span></div>", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Savings Simulator ──
+        st.markdown("<div class='section-header'>🎛️ Savings Simulator</div>", unsafe_allow_html=True)
+        st.markdown("<div class='info-bar'>Drag the sliders to adjust how many minutes per month each appliance runs. See instantly how your bill changes.</div>", unsafe_allow_html=True)
+
+        current_total_bill = total_bill['total_jod']
+        new_forecast_rows  = []
+
+        slider_cols = st.columns(2)
+        for i, row in enumerate(forecast_rows):
+            app = row['app']; cfg = row['cfg']
+            on_min_monthly = results[app]['on_minutes'] * (hours_in_month / max(duration_h, 0.01))
+            with slider_cols[i % 2]:
+                color = cfg['color']; icon = cfg['icon']; label = cfg['label']
+                st.markdown(f"<span style='color:{color};font-size:1.2rem'>{icon}</span> **{label}**", unsafe_allow_html=True)
+                st.markdown(f"<span style='color:#6868a0;font-size:0.8rem'>Current projection: {on_min_monthly:.0f} min/month · {row['kwh_monthly']:.2f} kWh/month</span>", unsafe_allow_html=True)
+                new_minutes = st.slider(
+                    f"{label}", min_value=0,
+                    max_value=int(on_min_monthly * 2) + 120,
+                    value=int(on_min_monthly), step=5,
+                    key=f"slider_{app}", label_visibility="collapsed",
+                )
+                new_kwh = new_minutes * cfg['mean_watts'] / 1000 / 60
+                new_forecast_rows.append({'app':app,'cfg':cfg,'old_kwh':row['kwh_monthly'],'new_kwh':new_kwh,'old_min':on_min_monthly,'new_min':new_minutes})
+
+        # New bill calculation
+        new_total_kwh  = sum(r['new_kwh'] for r in new_forecast_rows)
+        new_total_bill = calc_jordan_bill(new_total_kwh)
+        savings        = current_total_bill - new_total_bill['total_jod']
+
+        st.markdown("<div class='section-header'>📊 Results</div>", unsafe_allow_html=True)
+        s_cols = st.columns(3)
+        with s_cols[0]:
+            st.markdown(f"<div class='kpi-card indigo'><div class='kpi-label'>Current Bill</div><div class='kpi-value'>{current_total_bill:.3f}</div><div class='kpi-sub'>JOD / month</div></div>", unsafe_allow_html=True)
+        with s_cols[1]:
+            st.markdown(f"<div class='kpi-card blue'><div class='kpi-label'>New Projected Bill</div><div class='kpi-value'>{new_total_bill['total_jod']:.3f}</div><div class='kpi-sub'>JOD / month</div></div>", unsafe_allow_html=True)
+        with s_cols[2]:
+            cn = 'green' if savings > 0 else 'red'
+            sign = '-' if savings > 0 else '+'
+            label_str = 'Monthly Savings' if savings > 0 else 'Extra Cost'
+            st.markdown(f"<div class='kpi-card {cn}'><div class='kpi-label'>{label_str}</div><div class='kpi-value'>{sign}{abs(savings):.3f}</div><div class='kpi-sub'>JOD / month</div></div>", unsafe_allow_html=True)
+
+        # Per-appliance table
+        rows_table = []
+        for r in new_forecast_rows:
+            diff_min = r['new_min'] - r['old_min']
+            diff_kwh = r['new_kwh'] - r['old_kwh']
+            rows_table.append({
+                'Appliance':       r['cfg']['icon']+' '+r['cfg']['label'],
+                'Current (min/mo)':f"{r['old_min']:.0f}",
+                'Adjusted (min/mo)':f"{r['new_min']}",
+                'Change':          f"{'+' if diff_min>0 else ''}{diff_min:.0f} min",
+                'kWh Change':      f"{'+' if diff_kwh>0 else ''}{diff_kwh:.2f} kWh",
+                'New kWh/month':   f"{r['new_kwh']:.2f}",
+            })
+        st.dataframe(pd.DataFrame(rows_table), hide_index=True, use_container_width=True)
+
+        if savings > 0:
+            st.markdown(f"<div class='saving-tip'>💰 By adjusting your usage, you save <b>{savings:.3f} JOD/month</b> — that's <b>{savings*12:.2f} JOD/year</b>!</div>", unsafe_allow_html=True)
+            # Biggest saving tip
+            biggest = max(new_forecast_rows, key=lambda r: r['old_kwh']-r['new_kwh'])
+            if biggest['old_kwh'] > biggest['new_kwh']:
+                saved_kwh = biggest['old_kwh'] - biggest['new_kwh']
+                st.markdown(f"<div class='saving-tip'>⚡ Biggest saving comes from <b>{biggest['cfg']['label']}</b> — reducing by {biggest['old_min']-biggest['new_min']:.0f} min/month saves <b>{saved_kwh:.2f} kWh</b></div>", unsafe_allow_html=True)
+        elif savings < 0:
+            st.warning(f"⚠️ Increased usage will add {abs(savings):.3f} JOD/month to your bill.")
+        else:
+            st.info("No change in estimated bill.")
