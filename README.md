@@ -67,4 +67,4 @@ Screenshots and a walkthrough of the app are included in the full project report
 4. To run the app: `cd app && streamlit run app.py`
 ## Acknowledgements
 Originally developed as a graduation project supervised by Dr. Ruba Obiedat, King Abdullah II School of Information Technology, University of Jordan, using the REFIT dataset (Murray et al., 2017).
-where to paste this
+
