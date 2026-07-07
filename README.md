@@ -29,19 +29,16 @@ Final CNN-BiLSTM phase — per-appliance window size and threshold tuning, yield
 
 Framework: PyTorch 2.6, trained on Google Colab.
 
-Demo
+ Demo
 
 The system is deployed as a 5-page Streamlit web application providing:
+- Live disaggregation
+- Usage analytics
+- Bill estimation (Jordan EMRC tariffs)
+- Energy forecasting
+- A savings simulator
 
-
-Live disaggregation
-Usage analytics
-Bill estimation (Jordan EMRC tariffs)
-Energy forecasting
-A savings simulator
-
-
-(screenshots below)
+Screenshots and a walkthrough of the app are included in the full project report (see docs/NILM_KASIT_v3_Final.pdf).
 
 What I'd Improve
 
