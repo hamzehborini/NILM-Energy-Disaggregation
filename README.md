@@ -59,3 +59,12 @@ Screenshots and a walkthrough of the app are included in the full project report
 ├── app/            # Streamlit deployment app
 ├── docs/           # Full project report (PDF)
 └── README.md
+
+## How to Run
+1. Clone the repo: `git clone https://github.com/hamzehborini/NILM-Energy-Disaggregation.git`
+2. Install dependencies: `pip install -r requirements.txt`
+3. To explore model training: open notebooks in `code/` via Jupyter or Colab
+4. To run the app: `cd app && streamlit run app.py`
+## Acknowledgements
+Originally developed as a graduation project supervised by Dr. Ruba Obiedat, King Abdullah II School of Information Technology, University of Jordan, using the REFIT dataset (Murray et al., 2017).
+where to paste this
