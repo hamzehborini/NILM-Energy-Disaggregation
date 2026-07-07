@@ -55,3 +55,7 @@ Screenshots and a walkthrough of the app are included in the full project report
 - **Training**: Google Colab + Google Drive
 
 ## Repository Structure
+├── code/           # Model training notebooks (kettle, fridge, washing machine, dishwasher)
+├── app/            # Streamlit deployment app
+├── docs/           # Full project report (PDF)
+└── README.md
